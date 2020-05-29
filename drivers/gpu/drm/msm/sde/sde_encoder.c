@@ -4703,6 +4703,12 @@ int sde_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc,
 		sde_configure_qdss(sde_enc, sde_enc->cur_master->hw_qdss,
 				sde_enc->cur_master, sde_kms->qdss_enabled);
 
+	if (sde_enc->cur_master && sde_enc->cur_master->connector) {
+		struct sde_connector *c_conn;
+		c_conn = to_sde_connector(sde_enc->cur_master->connector);
+		sde_connector_update_hbm(c_conn);
+	}
+
 end:
 	SDE_ATRACE_END("sde_encoder_prepare_for_kickoff");
 	return ret;
@@ -4749,7 +4755,6 @@ static int _sde_encoder_reset_ctl_hw(struct drm_encoder *drm_enc)
 
 void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error)
 {
-	static bool first_run = true;
 	struct sde_encoder_virt *sde_enc;
 	struct sde_encoder_phys *phys;
 	ktime_t wakeup_time;
@@ -4789,25 +4794,6 @@ void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error)
 		struct dsi_bridge *c_bridge = container_of((drm_enc->bridge), struct dsi_bridge, base);
 		if (c_bridge && c_bridge->display && c_bridge->display->panel)
 			c_bridge->display->panel->kickoff_count++;
-	}
-
-	/*
-	 * Trigger a panel reset if this is the first kickoff and the refresh
-	 * rate is not 60 Hz
-	 */
-	if (cmpxchg(&first_run, true, false) &&
-	    sde_enc->crtc->mode.vrefresh != 60) {
-		struct sde_connector *conn = container_of(phys->connector, struct sde_connector, base);
-		struct drm_event event = {
-			.type = DRM_EVENT_PANEL_DEAD,
-			.length = sizeof(bool)
-		};
-
-		conn->panel_dead = true;
-		event.type = DRM_EVENT_PANEL_DEAD;
-		event.length = sizeof(bool);
-		msm_mode_object_event_notify(&conn->base.base,
-			conn->base.dev, &event, (u8 *) &conn->panel_dead);
 	}
 
 	SDE_ATRACE_END("encoder_kickoff");
@@ -4907,6 +4893,16 @@ void sde_encoder_prepare_commit(struct drm_encoder *drm_enc)
 					ctl->ops.clear_pending_flush)
 				ctl->ops.clear_pending_flush(ctl);
 		}
+	}
+
+	if (sde_enc->cur_master && sde_enc->cur_master->connector) {
+		rc = sde_connector_prepare_commit(
+				  sde_enc->cur_master->connector);
+		if (rc)
+			SDE_ERROR_ENC(sde_enc,
+				      "prepare commit failed conn %d rc %d\n",
+				      sde_enc->cur_master->connector->base.id,
+				      rc);
 	}
 
 	if (sde_enc->cur_master && sde_enc->cur_master->connector) {

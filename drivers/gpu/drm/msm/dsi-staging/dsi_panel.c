@@ -1011,6 +1011,11 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 		goto error;
 	}
 
+	if (mode->refresh_rate != 60) {
+		pr_warn("setting panel refresh rate to values above 60 is not allowed");
+		mode->refresh_rate = 60;
+	}
+
 	rc = utils->read_u32(utils->data, "qcom,mdss-dsi-panel-width",
 				  &mode->h_active);
 	if (rc) {
@@ -3644,14 +3649,34 @@ static int dsi_panel_parse_mi_config(struct dsi_panel *panel,
 		pr_info("fod_off_dimming_delay %d\n", panel->fod_off_dimming_delay);
 	}
 
+	rc = utils->read_u32(of_node,
+			"qcom,disp-backlight-pulse-threshold", &panel->backlight_pulse_threshold);
+	if (rc) {
+		panel->backlight_pulse_threshold = BACKLIGHT_PLUSE_THRESHOLD;
+		pr_info("default backlight_pulse_threshold %d\n", BACKLIGHT_PLUSE_THRESHOLD);
+	} else {
+		pr_info("backlight_pulse_threshold %d\n", panel->backlight_pulse_threshold);
+	}
+
+	panel->fod_dimlayer_enabled = utils->read_bool(of_node,
+			"qcom,mdss-dsi-panel-fod-dimlayer-enabled");
+	if (panel->fod_dimlayer_enabled) {
+		pr_info("fod dimlayer enabled.\n");
+	} else {
+		pr_info("fod dimlayer disabled.\n");
+	}
+
 	dsi_panel_parse_elvss_dimming_config(panel);
 
+	panel->hbm_enabled = false;
 	panel->fod_hbm_enabled = false;
+	panel->fod_dimlayer_hbm_enabled = false;
 	panel->skip_dimmingon = STATE_NONE;
 	panel->fod_backlight_flag = false;
 	panel->backlight_delta = 1;
 	panel->fod_flag = false;
 	panel->in_aod = false;
+	panel->backlight_pulse_flag = false;
 	panel->fod_hbm_off_time = ktime_get();
 	panel->fod_backlight_off_time = ktime_get();
 
@@ -3664,6 +3689,7 @@ static int dsi_panel_parse_mi_config(struct dsi_panel *panel,
 	panel->bl_lowlevel_duration = 0;
 	panel->hbm_duration = 0;
 	panel->hbm_times = 0;
+	panel->dc_enable = false;
 
 	return rc;
 }
@@ -3793,13 +3819,13 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	if (rc)
 		pr_debug("failed to parse esd config, rc=%d\n", rc);
 
+	panel->power_mode = SDE_MODE_DPMS_OFF;
+
 	rc = dsi_panel_parse_mi_config(panel, of_node);
 	if (rc)
 		pr_err("failed to parse mi config, rc=%d\n", rc);
 
 	g_panel = panel;
-
-	panel->power_mode = SDE_MODE_DPMS_OFF;
 
 	drm_panel_init(&panel->drm_panel);
 	mutex_init(&panel->panel_lock);
@@ -4182,6 +4208,7 @@ int dsi_panel_validate_mode(struct dsi_panel *panel,
 
 int dsi_panel_get_mode_count(struct dsi_panel *panel)
 {
+	const u32 SINGLE_MODE_SUPPORT = 1;
 	struct dsi_parser_utils *utils;
 	struct device_node *timings_np;
 	int count, rc = 0;
@@ -4210,6 +4237,11 @@ int dsi_panel_get_mode_count(struct dsi_panel *panel)
 		rc = -EINVAL;
 		goto error;
 	}
+
+	/* No multiresolution support is available for video mode panels */
+	if (panel->panel_mode != DSI_OP_CMD_MODE &&
+		!panel->host_config.ext_bridge_num)
+		count = SINGLE_MODE_SUPPORT;
 
 	panel->num_timing_nodes = count;
 
@@ -4512,9 +4544,9 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 		pr_err("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
 		       panel->name, rc);
 
-	if (panel->fod_hbm_enabled || panel->fod_backlight_flag) {
-		pr_info("%s skip [hbm=%d][fod_bl=%d]\n", __func__,
-			panel->fod_hbm_enabled, panel->fod_backlight_flag);
+	if (panel->fod_hbm_enabled || panel->fod_backlight_flag || panel->fod_dimlayer_hbm_enabled) {
+		pr_debug("%s skip [hbm=%d][fod_bl=%d][dimlayer_hbm=%d]\n", __func__,
+			panel->fod_hbm_enabled, panel->fod_backlight_flag, panel->fod_dimlayer_hbm_enabled);
 	} else {
 		struct dsi_display *display = NULL;
 		struct mipi_dsi_host *host = panel->host;
@@ -4590,7 +4622,7 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 	pr_info("%s\n", __func__);
 	mutex_lock(&panel->panel_lock);
 
-	if (!panel->fod_hbm_enabled) {
+	if (!panel->fod_hbm_enabled && !panel->fod_dimlayer_hbm_enabled) {
 		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_NOLP);
 		if (rc)
 			pr_err("[%s] failed to send DSI_CMD_SET_NOLP cmd, rc=%d\n",
@@ -4817,6 +4849,7 @@ int dsi_panel_send_roi_dcs(struct dsi_panel *panel, int ctrl_idx,
 	return rc;
 }
 
+extern bool g_idleflag;
 static int panel_disp_param_send_lock(struct dsi_panel *panel, int param)
 {
 	int rc = 0;
@@ -4987,6 +5020,7 @@ static int panel_disp_param_send_lock(struct dsi_panel *panel, int param)
 		pr_debug("hbm on\n");
 		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_HBM_ON);
 		panel->skip_dimmingon = STATE_DIM_BLOCK;
+		panel->hbm_enabled = true;
 		break;
 	case DISPPARAM_HBM_FOD_ON:
 		pr_debug("hbm fod on\n");
@@ -5061,7 +5095,17 @@ static int panel_disp_param_send_lock(struct dsi_panel *panel, int param)
 		pr_debug("hbm off\n");
 		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_HBM_OFF);
 		panel->skip_dimmingon = STATE_DIM_RESTORE;
+		panel->hbm_enabled = false;
 		break;
+	case DISPPARAM_DC_ON:
+		pr_info("DC on\n");
+		panel->dc_enable = true;
+		rc = dsi_panel_update_backlight(panel, panel->last_bl_lvl);
+		break;
+	case DISPPARAM_DC_OFF:
+		pr_info("DC off\n");
+		panel->dc_enable = false;
+		rc = dsi_panel_update_backlight(panel, panel->last_bl_lvl);
 	default:
 		break;
 	}
@@ -5228,6 +5272,14 @@ static int panel_disp_param_send_lock(struct dsi_panel *panel, int param)
 						= (panel->elvss_dimming_cmds.rbuf[0]) & 0x7F;
 		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_ELVSS_DIMMING_OFF);
 		break;
+	case DISPPARAM_IDLE_ON:
+		pr_info("idle on\n");
+		g_idleflag = true;
+		break;
+	case DISPPARAM_IDLE_OFF:
+		pr_info("idle off\n");
+		g_idleflag = false;
+		break;
 	default:
 		break;
 	}
@@ -5362,8 +5414,11 @@ int dsi_panel_enable(struct dsi_panel *panel)
 	else
 		panel->panel_initialized = true;
 
+	panel->hbm_enabled = false;
 	panel->fod_hbm_enabled = false;
+	panel->fod_dimlayer_hbm_enabled = false;
 	panel->in_aod = false;
+	panel->backlight_pulse_flag = false;
 	panel->skip_dimmingon = STATE_NONE;
 
 	dsi_panel_esd_irq_ctrl(panel, true);
@@ -5460,8 +5515,11 @@ int dsi_panel_disable(struct dsi_panel *panel)
 
 	panel->panel_initialized = false;
 	panel->skip_dimmingon = STATE_NONE;
+	panel->hbm_enabled = false;
 	panel->fod_hbm_enabled = false;
+	panel->fod_dimlayer_hbm_enabled = false;
 	panel->in_aod = false;
+	panel->backlight_pulse_flag = false;
 	panel->fod_backlight_flag = false;
 	panel->power_mode = SDE_MODE_DPMS_OFF;
 

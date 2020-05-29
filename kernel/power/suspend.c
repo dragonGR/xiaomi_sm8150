@@ -257,6 +257,7 @@ static void s2idle_loop(void)
 
 	for (;;) {
 		int error;
+		bool leave_s2idle = false;
 
 		dpm_noirq_begin();
 
@@ -270,10 +271,27 @@ static void s2idle_loop(void)
 		 * so prevent them from terminating the loop right away.
 		 */
 		error = dpm_noirq_suspend_devices(PMSG_SUSPEND);
-		if (!error)
+		if (!error) {
 			s2idle_enter();
-		else if (error == -EBUSY && pm_wakeup_pending())
+			/*
+			 * Once we enter s2idle_enter(), returning means that
+			 * either:
+			 * 1) an abort was detected prior to suspending, or
+			 * 2) something caused us to wake from suspended
+			 * If we got an abort or a wakeup interrupt, we need
+			 * to break out of this loop.  If we were woken by
+			 * an interrupt that technically doesn't require a
+			 * full wakeup (only a few corner cases), we're going
+			 * to wake up anyway, because the way this new
+			 * s2idle_loop() flow works, the resume of devices
+			 * below will cause an abort even if we could
+			 * otherwise have looped back into suspend.
+			 */
+			leave_s2idle = true;
+		} else if (error == -EBUSY && pm_wakeup_pending()) {
+			leave_s2idle = true;
 			error = 0;
+		}
 
 		if (!error && s2idle_ops && s2idle_ops->wake)
 			s2idle_ops->wake();
@@ -288,10 +306,17 @@ static void s2idle_loop(void)
 		if (s2idle_ops && s2idle_ops->sync)
 			s2idle_ops->sync();
 
-		if (pm_wakeup_pending())
+		if (leave_s2idle || pm_wakeup_pending())
 			break;
 
+		/*
+		 * Since we are going to loop around and attempt to go back
+		 * into suspend, ensure that all wakeup reason logging from
+		 * this partial resume gets cleared first (which will also
+		 * reenable wakeup reason logging).
+		 */
 		pm_wakeup_clear(false);
+		clear_wakeup_reasons();
 	}
 
 	pm_pr_dbg("resume from suspend-to-idle\n");
@@ -642,7 +667,7 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
  */
 int suspend_devices_and_enter(suspend_state_t state)
 {
-	int error;
+	int error, last_dev;
 	bool wakeup = false;
 
 	if (!sleep_state_supported(state))
@@ -658,8 +683,11 @@ int suspend_devices_and_enter(suspend_state_t state)
 	suspend_test_start();
 	error = dpm_suspend_start(PMSG_SUSPEND);
 	if (error) {
+		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
+		last_dev %= REC_FAILED_NUM;
 		pr_err("Some devices failed to suspend, or early wake event detected\n");
-		log_suspend_abort_reason("Some devices failed to suspend, or early wake event detected");
+		log_suspend_abort_reason("%s device failed to suspend, or early wake event detected",
+			suspend_stats.failed_devs[last_dev]);
 		goto Recover_platform;
 	}
 	suspend_test_finish("suspend devices");
