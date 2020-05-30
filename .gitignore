@@ -130,3 +130,5 @@ kernel/configs/android-*.cfg
 build.sh
 build/
 out/
+/fkm/
+/.github/
